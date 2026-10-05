@@ -148,6 +148,44 @@ notice_patterns = [
 
 ---
 
+## 4.5 跨插件 API（v1.4.0 新增）
+
+### `get_recent_newcomers` — 只读查询最近的新成员
+
+```python
+@API("get_recent_newcomers", version="1", public=True)
+async def api_get_recent_newcomers(self, since_seconds: int = 86400, limit: int = 20) -> dict
+```
+
+**参数**：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `since_seconds` | `86400` | 时间窗（秒），只回首次出现时间在 `now - since_seconds` 之后的成员；`<=0` = 不限窗口（全部历史） |
+| `limit` | `20` | **每群**返回条数上限，钳到 `1..100`；按首次出现时间**倒序**（最新在前） |
+
+**返回**（结构永远完整的纯 dict，任何情况下不抛异常）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `schema_version` | `int` | 恒为 `1` |
+| `reason` | `str` | 空 = 数据正常；否则说明降级原因（见下） |
+| `active` | `bool` | `on_load` 已完成、状态已加载 |
+| `groups` | `dict` | `{"<群号>": {"last_welcome_at": float, "new_members": [{"user_id": str, "first_seen": float}]}}`；只含时间窗内有新成员的群 |
+
+**`reason` 的取值**：`""`（正常）/ `插件尚未完成启动（状态未加载）`（active=False，不要用它的数据）/
+`暂无任何成员记录`（档案为空）/ `时间窗内没有新成员`（窗口过滤后为空）。
+
+**数据边界（重要）**：`seen_members.json` **只落盘 QQ 号 + 首次出现时间戳，没有昵称**——
+昵称只在欢迎瞬间临时解析、从不缓存。因此本 API 只能回答"群里来了个新人（QQ 号 x，时间 t）"，
+回答不了"来了谁"。`last_welcome_at` 为 `0.0` 表示该群从未触发过欢迎。
+
+**纪律承诺（有测试守着）**：本 API **纯筛选内存态**——零网络（不查昵称接口）、零写盘
+（`tests/test_cross_plugin_api.py` 断言调用前后 `_seen` 深度相等、状态文件 mtime 不变、
+零 capability 调用）。调用方可按任意频率轮询。
+
+---
+
 ## 5. 真机实测结论（2026-09-19）
 
 **路径 A 已确认可行。** 真实日志证据：
@@ -393,6 +431,15 @@ v1.0.6 的「已知成员过滤」仍保留，作为路径 2（文本兜底）�
 ---
 
 ## 9. 变更日志
+
+### v1.4.0（2026-10-05）— 新增只读跨插件 API `get_recent_newcomers`
+
+- `@API(version="1", public=True)`：把 `_seen` 档案里落在时间窗内的成员首次出现记录
+  只读暴露给其他插件（首個消费方：life-frequency 的"外面的世界"事件）。
+- 纯筛选既有时间戳：零网络、零写盘、不改任何既有行为；坏/空档案降级为
+  `groups={}` + `reason`，不抛异常。
+- `sdk.min_version` 维持 `2.5.0`（`@API` 自 SDK 2.1.0 起可用，已在 2.5.0 上实测通过）。
+- 声明边界：API 只含 QQ 号 + 时间戳，**不含昵称**（昵称从未落盘，见 §4.5）。
 
 ### v1.3.0（2026-09-23）— 新增 Planner 注入：欢迎当轮强制引导「不引用」
 

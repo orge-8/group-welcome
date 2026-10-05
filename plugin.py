@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from uuid import uuid4
 
-from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import API, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import CONFIG_RELOAD_SCOPE_SELF, ErrorPolicy, HookMode, HookOrder
 
 SUPPORTED_CONFIG_VERSION = "1.3.0"
@@ -308,6 +308,83 @@ class GroupWelcome(MaiBotPlugin):
             self._last_saved_at = now
         except OSError as exc:
             self.ctx.logger.warning("状态保存失败：%s", exc)
+
+    # ------------------------------------------------------------------ 跨插件只读 API
+
+    @API(
+        "get_recent_newcomers",
+        description="只读查询最近进入群的新成员（纯筛选已落盘的首次出现时间，零网络零写盘）",
+        version="1",
+        public=True,
+    )
+    async def api_get_recent_newcomers(
+        self, since_seconds: int = 86400, limit: int = 20, **kwargs: Any
+    ) -> dict[str, Any]:
+        """只读筛选 ``_seen`` 里落在时间窗内的成员首次出现记录，供其他插件轮询。
+
+        契约纪律（调用方可依赖，测试守着）：
+
+        - **零网络零写盘**：只读内存态 ``self._seen`` / ``self._last_trigger``，
+          绝不查询昵称接口——昵称从未落盘也无缓存，返回值只有 QQ 号 + 首次出现
+          时间戳（调用方的事件文案只能写"群里来了个新人"，这是数据边界不是缺陷）；
+        - **结构永远完整**：坏/空档案 → ``groups={}`` + ``reason``，任何内部异常
+          都降级为空结果，不抛异常；
+        - ``since_seconds <= 0`` 视为不限窗口（全部历史）；``limit`` 为**每群**
+          封顶，钳到 1..100，按首次出现时间倒序（最新在前）。
+        """
+        try:
+            window = float(since_seconds)
+        except (TypeError, ValueError):
+            window = 86400.0
+        try:
+            cap = int(limit)
+        except (TypeError, ValueError):
+            cap = 20
+        cap = min(max(cap, 1), 100)
+        now = time.time()
+        cutoff = (now - window) if window > 0 else 0.0
+
+        seen = self._seen if isinstance(self._seen, dict) else {}
+        triggers = self._last_trigger if isinstance(self._last_trigger, dict) else {}
+        groups: dict[str, dict[str, Any]] = {}
+        try:
+            for group_id, members in seen.items():
+                if not isinstance(members, dict):
+                    continue
+                hits = [
+                    {"user_id": str(uid), "first_seen": float(ts)}
+                    for uid, ts in members.items()
+                    if isinstance(ts, (int, float)) and float(ts) >= cutoff
+                ]
+                if not hits:
+                    continue
+                hits.sort(key=lambda item: item["first_seen"], reverse=True)
+                groups[str(group_id)] = {
+                    "last_welcome_at": float(triggers.get(group_id, 0.0) or 0.0),
+                    "new_members": hits[:cap],
+                }
+        except Exception as exc:  # noqa: BLE001 —— 状态畸形时降级为空结果而非抛出
+            return {
+                "schema_version": 1,
+                "reason": f"内部状态不可读，已降级：{exc}",
+                "active": self._loaded_at > 0,
+                "groups": {},
+            }
+
+        if self._loaded_at <= 0:
+            reason = "插件尚未完成启动（状态未加载）"
+        elif not seen:
+            reason = "暂无任何成员记录"
+        elif not groups:
+            reason = "时间窗内没有新成员"
+        else:
+            reason = ""
+        return {
+            "schema_version": 1,
+            "reason": reason,
+            "active": self._loaded_at > 0,
+            "groups": groups,
+        }
 
     # ------------------------------------------------------------------ 配置判定
 

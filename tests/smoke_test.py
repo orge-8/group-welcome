@@ -101,13 +101,22 @@ def main() -> int:
             from maibot_sdk.components import collect_components
 
             handlers = set()
+            api_comps = []
             for comp in collect_components(plugin):
                 meta = comp.get("metadata") or {}
                 name = meta.get("handler_name") or comp.get("handler_name") or ""
                 if name:
                     handlers.add(name)
+                if comp.get("type") == "API":
+                    api_comps.append(comp)
             assert "detect_newcomer" in handlers, f"hook 未注册: {handlers}"
             assert "cmd_welcome" in handlers, f"命令未注册: {handlers}"
+            assert len(api_comps) == 1, f"应恰好声明一个跨插件 API: {api_comps}"
+            if api_comps:
+                meta = api_comps[0].get("metadata") or {}
+                assert api_comps[0].get("name") == "get_recent_newcomers", api_comps[0]
+                assert str(meta.get("version")) == "1" and meta.get("public") is True, meta
+                assert meta.get("handler_name") == "api_get_recent_newcomers", meta
         except ImportError:
             pass  # 老 SDK 无 collect_components，跳过该项
 
