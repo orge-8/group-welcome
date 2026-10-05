@@ -440,6 +440,9 @@ v1.0.6 的「已知成员过滤」仍保留，作为路径 2（文本兜底）�
   `groups={}` + `reason`，不抛异常。
 - `sdk.min_version` 维持 `2.5.0`（`@API` 自 SDK 2.1.0 起可用，已在 2.5.0 上实测通过）。
 - 声明边界：API 只含 QQ 号 + 时间戳，**不含昵称**（昵称从未落盘，见 §4.5）。
+- 本版门禁实测（2026-10-05）：devkit `run_gates` **PASS 3 / SKIP 0 / FAIL 0**
+  （`check_plugin` PASS 38 / WARN 0 / FAIL 0、冒烟 OK、pytest 137 passed）；
+  插件中心自查器 `check_submission.py` PASS 20 / FAIL 0 / WARN 1（`https://` 误报）。
 
 ### v1.3.0（2026-09-23）— 新增 Planner 注入：欢迎当轮强制引导「不引用」
 
