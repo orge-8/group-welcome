@@ -364,6 +364,9 @@ class GroupWelcome(MaiBotPlugin):
                     "new_members": hits[:cap],
                 }
         except Exception as exc:  # noqa: BLE001 —— 状态畸形时降级为空结果而非抛出
+            # 降级必须留痕（全检第 12 项）：否则调用方只看到 groups 为空，
+            # 而插件日志里毫无线索。异常路径才触发，不会刷屏。
+            self.ctx.logger.warning("get_recent_newcomers 降级（内部状态不可读）：%r", exc)
             return {
                 "schema_version": 1,
                 "reason": f"内部状态不可读，已降级：{exc}",
