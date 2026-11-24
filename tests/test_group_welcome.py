@@ -920,3 +920,171 @@ def test_decrease_notice_not_treated_as_join(plugin) -> None:
 
     asyncio.run(run())
     assert host.calls_of("maisaka.proactive.trigger") == [], "退群通知被当成入群"
+
+
+# --------------------------------------------------------------- SnowLuma 适配器契约（v1.5.0）
+# napcat-adapter 已合并进 snowluma-adapter（Host 1.3.0 起）。以下契约按
+# MaiBot-SnowLuma-Adapter v1.3.2 源码核实（2026-11-21）：
+#   codecs/notice/message_codec.py:93  message_id = f"qq-notice-{uuid4().hex}"
+#   codecs/notice/message_codec.py:63-67  additional_config 仍写 napcat_notice_*（键名不变）
+#   codecs/notice/renderer.py:174-186  入群文本 = "[事件-群成员增加] {昵称} 加入了群聊/被邀请入群"
+#   codecs/notice/helpers.py:69-83  user_info 仍取 operator_id 优先（操作者陷阱依旧存在）
+
+SNOWLUMA_MID = "qq-notice-9532db6b5c3e40db846807a4e80601d0"
+
+
+def _snowluma_notice(
+    text: str,
+    *,
+    message_id: str = SNOWLUMA_MID,
+    with_payload: bool = True,
+    payload_user_id: str = "1000000002",
+    operator_id: str = "1000000001",
+    sub_type: str = "invite",
+) -> dict:
+    """按 SnowLuma v1.3.2 真实出站结构重建的入群通知载荷。
+
+    与旧 napcat-adapter 的差异：message_id 前缀 qq-notice-、
+    文本带 [事件-群成员增加] 前缀、session_id 为空串（由群号反查兜底）。
+    additional_config 键名保持 napcat_notice_*（源码核实未改名）。
+    """
+    additional: dict = {}
+    if with_payload:
+        additional = {
+            "napcat_notice_type": "group_increase",
+            "napcat_notice_sub_type": sub_type,
+            "napcat_notice_payload": {
+                "group_id": REAL_GROUP_ID,
+                "user_id": payload_user_id,
+                "operator_id": operator_id,
+                "self_id": REAL_SELF_ID,
+            },
+            "platform_io_target_group_id": REAL_GROUP_ID,
+        }
+    return {
+        "account_id": REAL_SELF_ID,
+        "is_at": False,
+        "is_command": False,
+        "is_emoji": False,
+        "is_mentioned": False,
+        "is_notify": True,
+        "is_picture": False,
+        "message_id": message_id,
+        "message_info": {
+            "additional_config": additional,
+            "group_info": {"group_id": REAL_GROUP_ID, "group_name": "测试群"},
+            # user_info 仍是操作者视角（helpers.resolve_actor_user_id）
+            "user_info": {
+                "user_id": operator_id,
+                "user_cardname": "",
+                "user_nickname": "示例用户",
+            },
+        },
+        "platform": "qq",
+        "processed_plain_text": text,
+        "raw_message": [{"type": "text", "data": {"text": text}}],
+        "session_id": "",
+        "timestamp": "1789807899.0",
+    }
+
+
+def test_snowluma_notice_detected_via_qq_notice_prefix(plugin) -> None:
+    """is_notify 缺失时，qq-notice- 前缀必须能兜住（旧前缀表不含它）。"""
+    message = _snowluma_notice("[事件-群成员增加] newbie 被邀请入群", with_payload=False)
+    message.pop("is_notify")
+    assert plugin._is_notice_message(message, message["processed_plain_text"]) is True
+
+
+def test_snowluma_increase_text_matches_nick(plugin) -> None:
+    """新渲染格式两种措辞都要能取到昵称（「被邀请入群」是旧正则的盲区）。"""
+    assert plugin._match_notice("[事件-群成员增加] newbie 被邀请入群") == "newbie"
+    assert plugin._match_notice("[事件-群成员增加] 张三 加入了群聊") == "张三"
+
+
+def test_snowluma_decrease_text_is_not_join(plugin) -> None:
+    """退群/踢人渲染文本不得命中入群正则。"""
+    for text in (
+        "[事件-群成员减少] 张三 离开了群聊",
+        "[事件-群成员减少] 张三 被 示例用户 移出了群聊",
+        "[事件-群成员减少] 麦麦被移出了群聊",
+        "[事件-群名变更] 群名称变更为 新群名",
+        "[事件-群消息撤回] 示例用户 撤回了一条消息（消息ID:123）",
+    ):
+        assert plugin._match_notice(text) == "", f"非入群文本被误判: {text}"
+        assert plugin._is_notice_message(_snowluma_notice(text, with_payload=False), text) is True
+
+
+def test_snowluma_authoritative_path_welcomes_real_newcomer(plugin) -> None:
+    """SnowLuma 载荷端到端：文本/user_info 都是操作者，intent 必须用 payload 里的新人。"""
+    import asyncio
+
+    host = plugin._test_host
+    plugin.config.welcome.warmup_seconds = 0
+    plugin.config.welcome.cooldown_seconds = 0
+    plugin.config.welcome.resolve_nickname = False
+    plugin._seen.clear()
+
+    async def run() -> None:
+        await plugin.detect_newcomer(
+            message=_snowluma_notice("[事件-群成员增加] 示例用户 被邀请入群")
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+    calls = host.calls_of("maisaka.proactive.trigger")
+    assert len(calls) == 1, "SnowLuma 权威路径未触发"
+    intent = str(calls[0].get("intent") or "")
+    assert "1000000002" in intent, f"intent 未使用真实新人 QQ: {intent}"
+    assert "1000000001" not in intent, f"intent 混入了操作者 QQ: {intent}"
+    assert "1000000002" in plugin._seen.get(REAL_GROUP_ID, {}), "真实新人未被登记"
+
+
+def test_snowluma_text_fallback_welcomes_invited_newcomer(plugin) -> None:
+    """无 additional_config 时（旧版/异常），新格式文本兜底也要能欢迎被邀请的新人。"""
+    import asyncio
+
+    host = plugin._test_host
+    plugin.config.welcome.warmup_seconds = 0
+    plugin.config.welcome.cooldown_seconds = 0
+    plugin.config.welcome.resolve_nickname = False
+    plugin._seen.clear()
+
+    message = _snowluma_notice("[事件-群成员增加] newbie 被邀请入群", with_payload=False)
+    # 文本兜底路径的身份来自 user_info：把它置为新人本人（无载荷可辨时的最好情况）
+    message["message_info"]["user_info"]["user_id"] = "1000000002"
+    message["message_info"]["user_info"]["user_nickname"] = "newbie"
+    message["session_id"] = REAL_SESSION
+
+    async def run() -> None:
+        await plugin.detect_newcomer(message=message)
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+    calls = host.calls_of("maisaka.proactive.trigger")
+    assert len(calls) == 1, "「被邀请入群」文本兜底失效（旧正则盲区）"
+    intent = str(calls[0].get("intent") or "")
+    assert "newbie" in intent, f"intent 未带新人昵称: {intent}"
+
+
+def test_snowluma_bot_self_join_skipped(plugin) -> None:
+    """bot 自己入群（payload.user_id == self_id）不欢迎——新载荷结构下同样成立。"""
+    import asyncio
+
+    host = plugin._test_host
+    plugin.config.welcome.warmup_seconds = 0
+    plugin.config.welcome.cooldown_seconds = 0
+    plugin._seen.clear()
+
+    async def run() -> None:
+        await plugin.detect_newcomer(
+            message=_snowluma_notice(
+                "[事件-群成员增加] 麦麦 加入了群聊", payload_user_id=REAL_SELF_ID, sub_type="approve"
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert host.calls_of("maisaka.proactive.trigger") == [], "bot 自己被当成新人欢迎"

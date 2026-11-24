@@ -1,5 +1,11 @@
 """群聊新人欢迎：捕获入群提示或首次发言，唤醒 Planner 由 LLM 自主决定如何欢迎新人。
 
+适配器基线（v1.5.0）：官方 napcat-adapter 已合并进 snowluma-adapter（Host 1.3.0 起），
+现行唯一官方链路 = MaiBot-SnowLuma-Adapter（NapCat / SnowLuma 对端都走它）。
+notice 契约据其 v1.3.2 源码核实（codecs/notice/message_codec.py）：
+`additional_config.napcat_notice_*` 键名保留（权威路径不变），
+但 message_id 前缀改为 `qq-notice-`、通知文本改为 `[事件-群成员增加] …` 渲染格式。
+
 设计要点：
   - **信号源双路**（SDK 没有任何成员事件 hook，只能这样取）：
       A. 入群提示优先：入站消息文本命中「入群提示」正则（若适配器把 notice 转成了消息）
@@ -26,7 +32,7 @@ from uuid import uuid4
 from maibot_sdk import API, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import CONFIG_RELOAD_SCOPE_SELF, ErrorPolicy, HookMode, HookOrder
 
-SUPPORTED_CONFIG_VERSION = "1.3.0"
+SUPPORTED_CONFIG_VERSION = "1.5.0"
 
 STATE_VERSION = 1
 STATE_FILENAME = "seen_members.json"
@@ -36,7 +42,10 @@ BOT_ID_HINTS = ("is_bot", "isBot", "bot")
 # 真机实测（2026-09-19）：napcat-adapter 把 QQ 的 notice 事件转成了普通消息，
 # message_id 形如 "napcat-notice-9532db6b5c3e40db846807a4e80601d0"，
 # 且载荷带 is_notify 标志位。这两者比文本匹配可靠得多，优先用它们判定「系统通知」。
-NOTICE_ID_PREFIXES = ("napcat-notice-", "notice-", "system-notice-")
+# v1.5.0：napcat-adapter 合并进 snowluma-adapter 后，message_id 前缀改为
+# "qq-notice-<uuid hex>"（SnowLuma v1.3.2 codecs/notice/message_codec.py:93），
+# 新增该前缀；旧前缀保留，兼容历史载荷与旧适配器。
+NOTICE_ID_PREFIXES = ("qq-notice-", "napcat-notice-", "notice-", "system-notice-")
 
 # 诊断用：最近收到的系统通知条数上限（内存缓存，供 `/欢迎 diag` 查看）
 MAX_RECENT_NOTICES = 20
@@ -116,8 +125,16 @@ DEFAULT_NOTICE_PATTERNS = [
     # 顺序即优先级：带「通过 / 被邀请」修饰的模式必须排在泛化的「加入了群聊」之前。
     # 否则 \S+? 会把修饰语一起吃进昵称——实测 "孙七被管理员邀请加入了本群" 会得到
     # "孙七被管理员邀请" 而非 "孙七"。
+    #
+    # 第 1 条（v1.5.0）：snowluma-adapter 渲染器的入群文本是
+    # "[事件-群成员增加] {昵称} 加入了群聊" / "[事件-群成员增加] {昵称} 被邀请入群"
+    # （SnowLuma v1.3.2 codecs/notice/renderer.py:174-186）。昵称经 resolve_display_name
+    # 取群名片/昵称（无空格单 token），事件前缀与昵称之间恰有一个空格，用锚定前缀 +
+    # 空格切分可无歧义取昵称；「被邀请入群」是旧四条正则都盖不住的新措辞。
+    # 第 3 条同时兼容「被 XX 邀请入群」旧式修饰（修饰语在 nick 组之外）。
+    r"\[事件-群成员增加\]\s+(?P<nick>\S+)\s+(?:加入了群聊|被邀请入群)",
     r"(?P<nick>\S+?)\s*(?:通过|经由).{0,16}?加入",
-    r"(?P<nick>\S+?)\s*被.{0,16}?邀请.{0,8}?加入",
+    r"(?P<nick>\S+?)\s*被.{0,16}?邀请(?:.{0,8}?加入|入群)",
     r"欢迎新(?:成员|同学|人|朋友)\s*[:：]?\s*(?P<nick>\S+)",
     r"(?P<nick>\S+?)\s*(?:加入了?群聊|加入了?本群|加入群聊|进群了)",
 ]
@@ -191,7 +208,7 @@ class WelcomeSectionConfig(PluginConfigBase):
     )
     resolve_nickname: bool = Field(
         default=True,
-        description="通过 napcat 接口查询新成员昵称（入群载荷只含 QQ 号）；查不到时退回仅显示 QQ 号",
+        description="通过适配器接口查询新成员昵称（入群载荷只含 QQ 号；snowluma-adapter 保留 adapter.napcat.* API 名）；查不到时退回仅显示 QQ 号",
     )
     no_quote_hint_seconds: float = Field(
         default=90.0,
@@ -613,7 +630,8 @@ class GroupWelcome(MaiBotPlugin):
         """判定是否为系统通知消息。
 
         优先用适配器给的硬信号——真机实测 notice 被转成消息时带 `is_notify=True`
-        且 `message_id` 形如 `napcat-notice-...`；两者都拿不到时才退回文本特征匹配。
+        且 `message_id` 形如 `qq-notice-...`（snowluma-adapter）或
+        `napcat-notice-...`（旧 napcat-adapter）；两者都拿不到时才退回文本特征匹配。
         """
         if isinstance(message, dict):
             if bool(message.get("is_notify")):
@@ -624,11 +642,13 @@ class GroupWelcome(MaiBotPlugin):
         return self._looks_like_notice(text)
 
     def _extract_raw_notice(self, message: Any) -> dict[str, Any] | None:
-        """从 `message_info.additional_config` 提取 napcat 的**原始 notice 载荷**。
+        """从 `message_info.additional_config` 提取适配器的**原始 notice 载荷**。
 
         这是获取「真实入群者 QQ」的唯一权威途径。
-        依据（2026-09-19，参照 ji-or-ji/group-awareness-plugin 的实现，MIT）：
-        napcat-adapter 会把原始 OneBot notice 放进 `additional_config`：
+        依据（2026-09-19，参照 ji-or-ji/group-awareness-plugin 的实现，MIT；
+        2026-11-21 按 MaiBot-SnowLuma-Adapter v1.3.2 源码复核，键名未变）：
+        适配器（原 napcat-adapter，现已合并进 snowluma-adapter）会把原始
+        OneBot notice 放进 `additional_config`：
 
             additional_config = {
                 "napcat_notice_type": "group_increase",
@@ -822,7 +842,10 @@ class GroupWelcome(MaiBotPlugin):
 
         权威 notice 载荷只给 QQ 号不给昵称（见 `_extract_raw_notice`），
         所以昵称必须主动查。接口与字段名取自已验证实现
-        `ji-or-ji/group-awareness-plugin`（MIT，真机跑通）：
+        `ji-or-ji/group-awareness-plugin`（MIT，真机跑通），
+        并按 MaiBot-SnowLuma-Adapter v1.3.2 `apis/group.py:173`、`apis/account.py:64`
+        复核：两个 API 同名保留、public=True（snowluma-adapter 另注册
+        `adapter.snowluma.*` / `adapter.onebot.*` 等价别名，本插件用 napcat 名即可）：
 
         - `adapter.napcat.group.get_group_member_info` → `card` / `nickname`
         - `adapter.napcat.account.get_stranger_info`   → `nick` / `nickname`
@@ -1079,7 +1102,7 @@ class GroupWelcome(MaiBotPlugin):
         text = payload["text"]
         message_id = str((message or {}).get("message_id") or "") if isinstance(message, dict) else ""
 
-        # ---- 路径 0（权威）：napcat 原始 notice 载荷 ----
+        # ---- 路径 0（权威）：适配器原始 notice 载荷（napcat_notice_* 键名） ----
         # 消息文本与 user_info 在某些通知里会被填成操作者，只有 payload.user_id
         # 才是真正的入群者。拿到它就完全不需要猜名字。
         raw = self._extract_raw_notice(message)
